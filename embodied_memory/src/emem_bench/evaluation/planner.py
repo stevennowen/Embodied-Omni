@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from .matchers import object_type
@@ -347,13 +348,22 @@ def select_history_frames(
     frames = []
     for index in picked:
         session_index, step_index, step = flat[index]
-        path = resolve_history_image(
-            step.get("image_path"),
-            episode_path=episode_path,
-            data_root=data_root,
-            session_index=session_index,
-            num_sessions=len(contexts),
-        )
+        try:
+            path = resolve_history_image(
+                step.get("image_path"),
+                episode_path=episode_path,
+                data_root=data_root,
+                session_index=session_index,
+                num_sessions=len(contexts),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            # resolve_history_image reports a missing image folder as an
+            # "ambiguous legacy image layout" ValueError.
+            raise FileNotFoundError(
+                f"Historical RGB for {Path(episode_path).parent.name} "
+                f"(session {session_index}, step {step_index}) is not available: {exc}. "
+                "--visual-only needs the episode images; download them first."
+            ) from exc
         frames.append(
             {
                 "session_index": session_index,
