@@ -12,6 +12,7 @@ Controller or metadata snapshot is needed.
 from __future__ import annotations
 
 import copy
+import os
 import re
 from functools import lru_cache
 from typing import Any
@@ -135,12 +136,15 @@ def _controller_metadata(scene_input: str | dict) -> dict:
     from ai2thor.controller import Controller
 
     platform = None
-    try:
-        from ai2thor.platform import CloudRendering
+    # EMEM_RENDER=x11 (set by `evaluate --render x11`) uses the X11 build on
+    # $DISPLAY instead of CloudRendering, which needs an NVIDIA Vulkan driver.
+    if os.environ.get("EMEM_RENDER", "cloud") != "x11":
+        try:
+            from ai2thor.platform import CloudRendering
 
-        platform = CloudRendering
-    except ImportError:
-        platform = None
+            platform = CloudRendering
+        except ImportError:
+            platform = None
 
     kwargs = dict(
         agentMode="default",

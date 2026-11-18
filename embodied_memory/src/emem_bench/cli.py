@@ -228,6 +228,9 @@ def main(argv=None):
             if args.visual_only and args.text_only:
                 parser.error("--visual-only and --text-only are mutually exclusive")
             args.api_key = os.environ.get(args.api_key_env)
+            # Read by helpers that start their own AI2-THOR controller
+            # (e.g. ProcTHOR scene metadata during emem ingestion).
+            os.environ["EMEM_RENDER"] = args.render
             from .evaluation.run import evaluate
 
             result = evaluate(rows, args)
