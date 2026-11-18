@@ -147,6 +147,13 @@ def main(argv=None):
     run.add_argument(
         "--text-only", action="store_true", help="Diagnostic only: omit RGB inputs"
     )
+    run.add_argument(
+        "--render",
+        choices=["cloud", "x11"],
+        default="cloud",
+        help="AI2-THOR renderer: headless CloudRendering (default) or the X11 build "
+        "using $DISPLAY (e.g. WSLg, where CloudRendering has no NVIDIA Vulkan driver)",
+    )
     score = subs.add_parser(
         "score", help="Offline scoring of an already executed action trace"
     )

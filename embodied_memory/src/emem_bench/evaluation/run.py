@@ -66,6 +66,7 @@ def evaluate(rows, args):
             strict_actions=True,
             include_all_targets=True,
             expose_l2_task_object_label=False,
+            headless=getattr(args, "render", "cloud") == "cloud",
         )
         matches = [
             i

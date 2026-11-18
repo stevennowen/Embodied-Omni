@@ -288,13 +288,21 @@ def read_http_response_with_deadline(response: Any, timeout: int) -> bytes:
     read1 = getattr(response, "read1", None)
     socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
     while True:
+        # http.client closes the socket once a Content-Length body is fully read
+        # (e.g. llama-server replies with "Connection: close"); calling
+        # settimeout() on it afterwards raises EBADF.
+        if response.isclosed():
+            return b"".join(chunks)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"HTTP response read exceeded {timeout}s deadline")
         if socket is not None:
-            current_timeout = socket.gettimeout()
-            if current_timeout is None or current_timeout > remaining:
-                socket.settimeout(remaining)
+            try:
+                current_timeout = socket.gettimeout()
+                if current_timeout is None or current_timeout > remaining:
+                    socket.settimeout(remaining)
+            except OSError:
+                socket = None
         try:
             chunk = read1(65536) if callable(read1) else response.read(1)
         except TimeoutError as exc:
