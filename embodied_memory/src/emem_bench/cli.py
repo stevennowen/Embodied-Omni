@@ -212,6 +212,9 @@ def main(argv=None):
                 result = {"episodes_checked": len(rows), "output": str(args.output)}
         else:
             args.api_key = os.environ.get(args.api_key_env)
+            # Read by helpers that start their own AI2-THOR controller
+            # (e.g. ProcTHOR scene metadata during emem ingestion).
+            os.environ["EMEM_RENDER"] = args.render
             from .evaluation.run import evaluate
 
             result = evaluate(rows, args)
