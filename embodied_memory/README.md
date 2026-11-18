@@ -217,6 +217,29 @@ emem-bench evaluate \
 Use `--all` only after a smoke run succeeds. Outputs contain per-episode traces, environment logs, and `summary.json`. The runner refuses to overwrite a non-empty output directory.
 Traces also include `final_world_state`, which is required for semantic offline scoring. Use `emem-bench score --episode EPISODE_JSON --probe-id PROBE_ID --trajectory TRACE_JSON` to rescore a runner trace. For a separate action list, provide the final simulator state with `--world-state STATE_JSON`; an action sequence alone cannot establish the final goal state.
 
+### Fork additions (branch `ta/visual-episodic-memory`)
+
+This fork adds three opt-in `evaluate` flags. Their defaults keep the original protocol unchanged; the default prompts are byte-identical to upstream.
+
+| Flag | Effect |
+|:--|:--|
+| `--render x11` | Use the AI2-THOR X11 build on `$DISPLAY` instead of headless CloudRendering (default `cloud`). Needed on WSL2/WSLg, where CloudRendering crashes for lack of an NVIDIA Vulkan driver. |
+| `--visual-only` | Hide the two text sources that are not required to act: the text history (`memory_context`, including `observation_note` memory-cue text) and the ground-truth `current_visible_objects` list. |
+| `--max-history-frames N` | With `--visual-only` in `full_context`, send N historical RGB frames (default 32) instead of the text history. Frames are sampled evenly over all context steps, the first and last step are always included, and each frame has a short caption of the action and its success/failure feedback. |
+
+Details of `--visual-only` per mode:
+- **`full_context`**: the prompt keeps the instruction, `held_object`, the model's own previous steps on this probe, `available_actions`, the captioned historical frames and the current RGB.
+- **`emem`**: ingestion and rollout prompts drop `visible_objects`, `new_visible_relations` and `current_visible_objects`, so memory writes must come from the RGB frames and the action/feedback text.
+- **Both modes**: scoring, episodes and the action space are unchanged. Historical RGB files must be downloaded; a missing frame aborts the run as an infrastructure error.
+
+```bash
+emem-bench evaluate --data-root "$EMEM_DATA_ROOT" --manifest "$EMEM_MANIFEST" \
+  --mode full_context --visual-only --max-history-frames 32 --render x11 \
+  --model MODEL_ALIAS --base-url http://localhost:8000/v1 --per-family 1 --output outputs/visual-smoke
+```
+
+The fork also fixes an `EBADF` error in `read_http_response_with_deadline`. It occurred with servers that close the connection after a `Content-Length` body, such as llama.cpp `llama-server`.
+
 ## Repository layout
 
 ```text

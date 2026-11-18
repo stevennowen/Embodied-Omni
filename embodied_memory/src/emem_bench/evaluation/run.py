@@ -11,7 +11,7 @@ from .grounding import (
     bind_action_to_observation_space,
     repair_action_id_from_structured_prediction,
 )
-from .planner import APIPlanner
+from .planner import APIPlanner, select_history_frames
 from .tool_agent import InvalidPhaseOutput, ToolAgent
 
 
@@ -54,6 +54,7 @@ def evaluate(rows, args):
     }
     (output / "run_config.json").write_text(json.dumps(public_args, indent=2))
     args.auto_memory_observe_step = False
+    visual_only = bool(getattr(args, "visual_only", False))
     results = []
     for index, row in enumerate(rows):
         episode_path = contained_path(args.data_root, row["source"]["episode_path"])
@@ -116,7 +117,18 @@ def evaluate(rows, args):
                     text_only=args.text_only,
                     max_context_steps=80,
                     max_visible_objects=40,
+                    visual_only=visual_only,
                 )
+                history_frames = None
+                if visual_only:
+                    # Chosen once per episode; the context does not change while acting.
+                    history_frames = select_history_frames(
+                        observation.get("context", []),
+                        episode_path=episode_path,
+                        data_root=args.data_root,
+                        k=args.max_history_frames,
+                    )
+                    observation["historical_images"] = history_frames
                 for _ in range(args.max_steps):
                     action, reasoning, payload, raw = planner.act(observation)
                     action, _ = repair_action_id_from_structured_prediction(
@@ -124,6 +136,8 @@ def evaluate(rows, args):
                     )
                     action, _ = bind_action_to_observation_space(action, observation)
                     observation, _, done, info = env.step(action, reasoning=reasoning)
+                    if history_frames is not None:
+                        observation["historical_images"] = history_frames
                     calls.append(planner.update_info(info, action, payload, raw))
                     if done:
                         break

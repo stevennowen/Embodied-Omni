@@ -125,6 +125,41 @@ Return ONLY a JSON object in this format:
 Do not return markdown or prose."""
 
 
+# --- Visual-only protocol (TA fork) ------------------------------------------
+# With --visual-only the model receives no text history (memory_context) and no
+# ground-truth list of visible objects. Past experience is shown as sampled
+# historical RGB frames, each captioned with the action taken and its feedback.
+
+_VISUAL_MEMORY_RULES = """Past memory is given only as historical RGB frames in chronological order.
+Each frame has a short caption with the action taken at that step and whether it succeeded.
+There is no text list of objects: recognise objects, containers and their locations from the images.
+Use the historical frames to recall where objects were last seen and which interactions failed,
+and do not repeat failed behaviors. If a later frame shows an object somewhere else, trust the later frame.
+When a caption mentions a preference violation, human intervention, or a corrected placement,
+infer the household rule from that evidence and follow it.
+The historical frames are past memory only; actions in them do not complete the current probe.
+"""
+
+
+def _replace_block(prompt: str, start: str, end: str, new: str) -> str:
+    i, j = prompt.index(start), prompt.index(end)
+    return prompt[:i] + new + prompt[j:]
+
+
+VISUAL_SYSTEM_PROMPT = _replace_block(
+    SYSTEM_PROMPT,
+    "Use the context trajectory to avoid repeated failed behaviors.",
+    "Use the Done action only",
+    _VISUAL_MEMORY_RULES,
+)
+VISUAL_SEQUENCE_SYSTEM_PROMPT = _replace_block(
+    SEQUENCE_SYSTEM_PROMPT,
+    "Use the memory_context as past evidence.",
+    "Return ONLY a JSON object",
+    _VISUAL_MEMORY_RULES,
+)
+
+
 OBJECT_ID_RE = re.compile(
     r"\b([A-Za-z][A-Za-z0-9_]*)"
     r"(?:\|[+-]?\d+(?:\.\d+)?){1,3}"
@@ -256,6 +291,90 @@ def sanitize_context_feedback(
             return "Action failed."
         return "Context feedback was observed."
     return text
+
+
+def history_frame_caption(step: dict, object_labels: dict[str, str] | None = None) -> str:
+    """Short action/feedback caption for one history frame (no object lists or cue notes)."""
+    action = step.get("action") or {}
+    feedback = step.get("feedback") or {}
+    action_type = action.get("action_type") or action.get("action")
+    target = action.get("target")
+    label = (object_labels or {}).get(target) or (
+        object_type(target) if isinstance(target, str) else None
+    )
+    text = sanitize_context_action_text(action.get("natural_language"), action_type)
+    if not isinstance(text, str) or not text:
+        text = " ".join(str(part) for part in (action_type, label) if part) or "observe"
+    success = feedback.get("success")
+    message = sanitize_context_feedback(
+        feedback.get("message"), success, preserve_durable_failure=True
+    )
+    outcome = {True: "succeeded", False: "failed"}.get(success, "no feedback")
+    caption = f"Action: {text.rstrip('. ')}. Outcome: {outcome}."
+    if isinstance(message, str) and message:
+        caption += f" Feedback: {message.rstrip('. ')}."
+    return caption
+
+
+def select_history_frames(
+    contexts: list[dict],
+    *,
+    episode_path,
+    data_root,
+    k: int,
+    object_labels: dict[str, str] | None = None,
+) -> list[dict]:
+    """Pick up to k history frames spread evenly over all context steps.
+
+    Steps of all sessions are concatenated chronologically; the first and the
+    last step are always kept. Each frame carries its RGB path and a caption.
+    """
+    from emem_bench.data import resolve_history_image
+
+    flat = [
+        (session_index, step_index, step)
+        for session_index, session in enumerate(contexts)
+        for step_index, step in enumerate(session.get("steps", []))
+    ]
+    if k <= 0 or not flat:
+        return []
+    if len(flat) <= k:
+        picked = range(len(flat))
+    elif k == 1:
+        picked = [len(flat) - 1]
+    else:
+        picked = sorted({round(i * (len(flat) - 1) / (k - 1)) for i in range(k)})
+    frames = []
+    for index in picked:
+        session_index, step_index, step = flat[index]
+        path = resolve_history_image(
+            step.get("image_path"),
+            episode_path=episode_path,
+            data_root=data_root,
+            session_index=session_index,
+            num_sessions=len(contexts),
+        )
+        frames.append(
+            {
+                "session_index": session_index,
+                "step_index": step_index,
+                "path": path,
+                "caption": history_frame_caption(step, object_labels),
+            }
+        )
+    return frames
+
+
+def _historical_frame_label(index: int, total: int, historical: dict) -> str:
+    label = (
+        "Historical RGB frame "
+        f"{index}/{total} "
+        f"(session {historical.get('session_index')}, "
+        f"step {historical.get('step_index')}; chronological order)."
+    )
+    if historical.get("caption"):
+        label += " " + str(historical["caption"])
+    return label
 
 
 def image_to_data_url(path: str) -> str:
@@ -745,6 +864,73 @@ def compact_history(history: list[dict], limit: int = 8) -> list[dict]:
     return compact_steps
 
 
+def _dump_prompt_payload(payload: dict, compact_json: bool) -> str:
+    serialized = _compact_prompt_payload(payload) if compact_json else payload
+    return json.dumps(
+        serialized,
+        ensure_ascii=False,
+        indent=None if compact_json else 2,
+        separators=(",", ":") if compact_json else None,
+    )
+
+
+def build_visual_user_prompt(
+    *, obs: dict, history: list[dict], compact_json: bool = False
+) -> str:
+    """Visual-only variant: no memory_context text and no visible-object list."""
+    payload = {
+        "instruction": obs.get("instruction"),
+        "held_object": compact_held_object(obs),
+        "previous_model_steps": compact_history(history),
+        "available_actions": compact_available_actions(
+            obs.get("available_actions", [])
+        ),
+    }
+    return (
+        "Select the next action. The action_id must be one of available_actions; "
+        "this list is the full selectable action space for this step. "
+        "Your memory of the past is the sequence of historical RGB frames that follows, "
+        "each captioned with the action taken and its outcome. Use them as evidence for "
+        "where objects are and which interactions failed; they do not mean the current "
+        "instruction is already complete. The last image is the current observation. "
+        "Pickupable objects may have Navigate actions; use Navigate before PickUp when needed. "
+        "Do not choose PutObject when held_object is null/nothing; pick up the object first. "
+        "Only choose Done after the task objective is satisfied. For placement or storage "
+        "instructions, a successful PickUp is only an intermediate step; continue until the "
+        "object is placed in the inferred target location. For retrieval-only instructions, "
+        "Done after pickup can be appropriate. "
+        "If a Navigate, Open, Close, or TransferContents action just succeeded, do not repeat "
+        "the same action on the same target; choose the next useful action.\n"
+        + _dump_prompt_payload(payload, compact_json)
+    )
+
+
+def build_visual_sequence_user_prompt(
+    *, obs: dict, history: list[dict], max_actions: int, compact_json: bool = False
+) -> str:
+    payload = {
+        "instruction": obs.get("instruction"),
+        "held_object": compact_held_object(obs),
+        "previous_model_steps": compact_history(history),
+        "initial_available_actions": compact_available_actions(
+            obs.get("available_actions", [])
+        ),
+        "max_actions": max_actions,
+    }
+    return (
+        "Plan the full next action sequence for this probe in one response. "
+        "Return at most max_actions actions. Use the initial_available_actions for the first "
+        "step and semantic action fields for later steps because future action_id values may "
+        "change after execution. Your memory of the past is the sequence of captioned "
+        "historical RGB frames that follows; the last image is the current observation. "
+        'Prefer this action object schema: {"action_type": "Navigate", "target_label": '
+        '"Fridge", "target_type": "Fridge"}. If an action has no target, such as Done, use '
+        '{"action_type": "Done"}. Do not repeat a failed action unless a successful action '
+        "has changed the state. Do not include hidden oracle fields or raw simulator object ids.\n"
+        + _dump_prompt_payload(payload, compact_json)
+    )
+
+
 def build_user_prompt(
     *,
     obs: dict,
@@ -752,7 +938,10 @@ def build_user_prompt(
     max_context_steps: int,
     max_visible_objects: int,
     compact_json: bool = False,
+    visual_only: bool = False,
 ) -> str:
+    if visual_only:
+        return build_visual_user_prompt(obs=obs, history=history, compact_json=compact_json)
     payload = {
         "instruction": obs.get("instruction"),
         "held_object": compact_held_object(obs),
@@ -822,7 +1011,12 @@ def build_sequence_user_prompt(
     max_visible_objects: int,
     max_actions: int,
     compact_json: bool = False,
+    visual_only: bool = False,
 ) -> str:
+    if visual_only:
+        return build_visual_sequence_user_prompt(
+            obs=obs, history=history, max_actions=max_actions, compact_json=compact_json
+        )
     payload = {
         "instruction": obs.get("instruction"),
         "held_object": compact_held_object(obs),
@@ -868,6 +1062,7 @@ def build_messages(
     max_context_steps: int,
     max_visible_objects: int,
     compact_json: bool = False,
+    visual_only: bool = False,
 ) -> list[dict]:
     text = build_user_prompt(
         obs=obs,
@@ -875,6 +1070,7 @@ def build_messages(
         max_context_steps=max_context_steps,
         max_visible_objects=max_visible_objects,
         compact_json=compact_json,
+        visual_only=visual_only,
     )
     if text_only:
         user_content: str | list[dict] = text
@@ -886,11 +1082,8 @@ def build_messages(
                 [
                     {
                         "type": "text",
-                        "text": (
-                            "Historical RGB frame "
-                            f"{image_index}/{len(historical_images)} "
-                            f"(session {historical.get('session_index')}, "
-                            f"step {historical.get('step_index')}; chronological order)."
+                        "text": _historical_frame_label(
+                            image_index, len(historical_images), historical
                         ),
                     },
                     {
@@ -912,7 +1105,10 @@ def build_messages(
             ]
         )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": VISUAL_SYSTEM_PROMPT if visual_only else SYSTEM_PROMPT,
+        },
         {"role": "user", "content": user_content},
     ]
 
@@ -927,6 +1123,7 @@ def build_sequence_messages(
     max_visible_objects: int,
     max_actions: int,
     compact_json: bool = False,
+    visual_only: bool = False,
 ) -> list[dict]:
     text = build_sequence_user_prompt(
         obs=obs,
@@ -935,6 +1132,7 @@ def build_sequence_messages(
         max_visible_objects=max_visible_objects,
         max_actions=max_actions,
         compact_json=compact_json,
+        visual_only=visual_only,
     )
     if text_only:
         user_content: str | list[dict] = text
@@ -946,11 +1144,8 @@ def build_sequence_messages(
                 [
                     {
                         "type": "text",
-                        "text": (
-                            "Historical RGB frame "
-                            f"{image_index}/{len(historical_images)} "
-                            f"(session {historical.get('session_index')}, "
-                            f"step {historical.get('step_index')}; chronological order)."
+                        "text": _historical_frame_label(
+                            image_index, len(historical_images), historical
                         ),
                     },
                     {
@@ -972,7 +1167,12 @@ def build_sequence_messages(
             ]
         )
     return [
-        {"role": "system", "content": SEQUENCE_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": VISUAL_SEQUENCE_SYSTEM_PROMPT
+            if visual_only
+            else SEQUENCE_SYSTEM_PROMPT,
+        },
         {"role": "user", "content": user_content},
     ]
 
@@ -1120,6 +1320,7 @@ class APIPlanner:
         max_context_steps: int,
         max_visible_objects: int,
         compact_json_prompt: bool = False,
+        visual_only: bool = False,
     ):
         self.model_name = model_name
         self.base_url = base_url
@@ -1133,6 +1334,7 @@ class APIPlanner:
         self.max_context_steps = max_context_steps
         self.max_visible_objects = max_visible_objects
         self.compact_json_prompt = compact_json_prompt
+        self.visual_only = visual_only
         self.history: list[dict] = []
         self.model_calls: list[dict[str, Any]] = []
         self.planner_steps = 0
@@ -1184,6 +1386,7 @@ class APIPlanner:
             max_context_steps=self.max_context_steps,
             max_visible_objects=self.max_visible_objects,
             compact_json=self.compact_json_prompt,
+            visual_only=self.visual_only,
         )
         self.planner_steps += 1
         content = ""
@@ -1237,6 +1440,7 @@ class APIPlanner:
             max_visible_objects=self.max_visible_objects,
             max_actions=max_actions,
             compact_json=self.compact_json_prompt,
+            visual_only=self.visual_only,
         )
         self.planner_steps += 1
         content = ""

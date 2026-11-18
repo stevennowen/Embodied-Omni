@@ -22,6 +22,17 @@ class InvalidPhaseOutput(ValueError):
     """The model returned JSON that violates the active phase contract."""
 
 
+# Ground-truth object lists hidden from the model under --visual-only. The full
+# observation is still used internally for ingestion state and write metadata.
+VISUAL_ONLY_HIDDEN_KEYS = ("visible_objects", "new_visible_relations", "current_visible_objects")
+
+
+def model_view(observation, visual_only):
+    if not visual_only or not isinstance(observation, dict):
+        return observation
+    return {k: v for k, v in observation.items() if k not in VISUAL_ONLY_HIDDEN_KEYS}
+
+
 def validate_calls(payload, phase, schemas):
     if not isinstance(payload, dict) or payload.get("phase") != phase:
         raise InvalidPhaseOutput(f"Expected phase={phase}")
@@ -59,6 +70,7 @@ class ToolAgent:
             enable_progress_action_guard=False,
         )
         self.calls = []
+        self.visual_only = bool(getattr(args, "visual_only", False))
 
     def schemas(self, names):
         return [
@@ -194,7 +206,7 @@ class ToolAgent:
                     )
                 payload = self.call(
                     "context_ingestion",
-                    observation,
+                    model_view(observation, self.visual_only),
                     image=path,
                     schemas=self.schemas(WRITE_TOOLS),
                 )
@@ -221,10 +233,13 @@ class ToolAgent:
                 )
 
     def act(self, env, observation, previous):
-        visible = protocol.compact_rollout_observation(
-            observation,
-            max_context_steps=0,
-            max_visible_objects=40,
+        visible = model_view(
+            protocol.compact_rollout_observation(
+                observation,
+                max_context_steps=0,
+                max_visible_objects=40,
+            ),
+            self.visual_only,
         )
         memory_payload = self.call(
             "memory",
@@ -267,10 +282,13 @@ class ToolAgent:
             payload = self.call(
                 "context_ingestion",
                 {
-                    "observation": protocol.compact_rollout_observation(
-                        {**next_observation, "instruction": ""},
-                        max_context_steps=0,
-                        max_visible_objects=40,
+                    "observation": model_view(
+                        protocol.compact_rollout_observation(
+                            {**next_observation, "instruction": ""},
+                            max_context_steps=0,
+                            max_visible_objects=40,
+                        ),
+                        self.visual_only,
                     ),
                     "executed_actions": protocol.model_visible_executed_actions(
                         executed

@@ -154,6 +154,20 @@ def main(argv=None):
         help="AI2-THOR renderer: headless CloudRendering (default) or the X11 build "
         "using $DISPLAY (e.g. WSLg, where CloudRendering has no NVIDIA Vulkan driver)",
     )
+    run.add_argument(
+        "--visual-only",
+        action="store_true",
+        help="TA protocol: drop the text history (memory_context) and the ground-truth "
+        "visible-object list; past experience is given as captioned historical RGB frames "
+        "(full_context) or ingested from RGB without object lists (emem)",
+    )
+    run.add_argument(
+        "--max-history-frames",
+        type=positive,
+        default=32,
+        help="With --visual-only in full_context mode: historical frames sampled evenly "
+        "over the whole context (first and last step always included)",
+    )
     score = subs.add_parser(
         "score", help="Offline scoring of an already executed action trace"
     )
@@ -211,6 +225,8 @@ def main(argv=None):
                     json.dump(result, stream, indent=2)
                 result = {"episodes_checked": len(rows), "output": str(args.output)}
         else:
+            if args.visual_only and args.text_only:
+                parser.error("--visual-only and --text-only are mutually exclusive")
             args.api_key = os.environ.get(args.api_key_env)
             from .evaluation.run import evaluate
 
